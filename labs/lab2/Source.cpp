@@ -1,518 +1,333 @@
-﻿#include <iostream>
+#include <boost/multiprecision/cpp_int.hpp>
+#include <openssl/evp.h>
 #include <cstdint>
 #include <cstring>
-#include <string>
-#include <algorithm>
-#include <stdexcept>
-#include <random>
+#include <iostream>
 #include <iomanip>
-#include <limits>
-#include <clocale>
-#include <cstdlib>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#include <algorithm>
 
+using namespace std;
+using BigInt = boost::multiprecision::cpp_int;
 
+namespace rsa_math {
+    inline random_device& rng_dev() { static random_device d; return d; }
+    inline mt19937_64& rng() { static mt19937_64 g(rng_dev()()); return g; }
 
-class Galua {
-private:
-    uint8_t poly_;   // фиксированный неприводимый многочлен 0x12B
-public:
-    explicit Galua(uint32_t p_x) {
-        poly_ = static_cast<uint8_t>(p_x & 0xFF);
+    inline int bit_length(const BigInt& x) { return x <= 0 ? 0 : (int)boost::multiprecision::msb(x) + 1; }
+    inline bool get_bit(const BigInt& x, int i) { return boost::multiprecision::bit_test(x, i); }
+
+    inline BigInt random_bigint(int bits) {
+        BigInt x = 0;
+        int words = (bits + 63) / 64;
+        for (int i = 0; i < words; ++i) { x <<= 64; x |= (uint64_t)rng()(); }
+        int extra = words * 64 - bits;
+        if (extra > 0) x >>= extra;
+        x |= (BigInt(1) << (bits - 1));
+        return x;
     }
 
-    uint8_t add(uint8_t a, uint8_t b) const { return a ^ b; }
-
-
-    uint8_t xtime(uint8_t a) const {
-        uint8_t mask = static_cast<uint8_t>(-(a >> 7));
-        return static_cast<uint8_t>((a << 1) ^ (mask & poly_));
+    inline BigInt random_below(const BigInt& n) {
+        if (n <= 0) throw runtime_error("random_below: n <= 0");
+        int bits = bit_length(n);
+        BigInt x = random_bigint(bits);
+        while (x >= n) x = random_bigint(bits);
+        return x;
     }
 
+    inline BigInt gcd_extended(const BigInt& a, const BigInt& b, BigInt& x, BigInt& y) {
+        if (b == 0) { x = 1; y = 0; return a; }
+        BigInt x1, y1;
+        BigInt g = gcd_extended(b, a % b, x1, y1);
+        x = y1; y = x1 - (a / b) * y1;
+        return g;
+    }
 
-    uint8_t mult(uint8_t a, uint8_t b) const {
-        uint8_t result = 0;
-        uint8_t x = a;
-        for (int i = 0; i < 8; ++i) {
-            uint8_t mask = static_cast<uint8_t>(-((b >> i) & 1));
-            result ^= x & mask;
-            x = xtime(x);
+    inline BigInt mod_inverse(const BigInt& a, const BigInt& m) {
+        BigInt x, y;
+        if (gcd_extended(a, m, x, y) != 1) throw runtime_error("mod_inverse: not coprime");
+        return ((x % m) + m) % m;
+    }
+
+    inline BigInt mod_pow_ladder(const BigInt& base_in, const BigInt& exp, const BigInt& mod) {
+        if (mod == 1) return BigInt(0);
+        BigInt base = base_in % mod;
+        if (base < 0) base += mod;
+        BigInt R0 = 1 % mod, R1 = base;
+        int bits = bit_length(exp);
+        for (int i = bits - 1; i >= 0; --i) {
+            BigInt mask = get_bit(exp, i) ? BigInt(1) : BigInt(0);
+            BigInt diff = (R0 - R1) * mask; R0 -= diff; R1 += diff;
+            R1 = (R0 * R1) % mod;
+            R0 = (R0 * R0) % mod;
+            BigInt diff2 = (R0 - R1) * mask; R0 -= diff2; R1 += diff2;
         }
-        return result;
+        return R0;
     }
 
-    uint8_t inverse(uint8_t a) const {
-        uint8_t a2 = mult(a, a);
-        uint8_t a4 = mult(a2, a2);
-        uint8_t a8 = mult(a4, a4);
-        uint8_t a16 = mult(a8, a8);
-        uint8_t a32 = mult(a16, a16);
-        uint8_t a64 = mult(a32, a32);
-        uint8_t a128 = mult(a64, a64);
-        uint8_t r = mult(a2, a4);
-        r = mult(r, a8);
-        r = mult(r, a16);
-        r = mult(r, a32);
-        r = mult(r, a64);
-        r = mult(r, a128);
-        return r;
+    inline BigInt mod_pow(const BigInt& base, const BigInt& exp, const BigInt& mod) {
+        return mod_pow_ladder(base, exp, mod);
     }
 
-    void generateInverseTable(uint8_t table[256]) const {
-        for (int i = 0; i < 256; ++i) {
-            table[i] = inverse(static_cast<uint8_t>(i));
+    inline bool miller_rabin(const BigInt& n, int rounds = 40) {
+        if (n < 2) return false;
+        if (n < 4) return true;
+        if ((n & 1) == 0) return false;
+        static const int sp[] = { 3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97 };
+        for (int p : sp) { if (n == p) return true; if (n % p == 0) return false; }
+        BigInt d = n - 1; int s = 0;
+        while ((d & 1) == 0) { d >>= 1; ++s; }
+        for (int r = 0; r < rounds; ++r) {
+            BigInt a = 2 + random_below(n - 3);
+            BigInt x = mod_pow(a, d, n);
+            if (x == 1 || x == n - 1) continue;
+            bool composite = true;
+            for (int i = 0; i < s - 1; ++i) {
+                x = (x * x) % n;
+                if (x == n - 1) { composite = false; break; }
+            }
+            if (composite) return false;
         }
-    }
-};
-
-class BelT {
-private:
-    static const uint8_t H_TABLE[256];
-    uint32_t roundKeys[57];
-
-    void keySchedule(const std::string& keyStr);
-
-    static uint32_t loadBE32(const uint8_t* p) {
-        return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16)
-            | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
-    }
-    static void storeBE32(uint8_t* p, uint32_t v) {
-        p[0] = uint8_t(v >> 24); p[1] = uint8_t(v >> 16);
-        p[2] = uint8_t(v >> 8); p[3] = uint8_t(v);
+        return true;
     }
 
-    void cryptBlock(const uint8_t in[16], uint8_t out[16]) const;
-
-public:
-    BelT() { std::memset(roundKeys, 0, sizeof(roundKeys)); }
-
-
-    uint32_t rotl(uint32_t x, int r) const {
-        return (x << r) | (x >> (32 - r));
-    }
-
-
-    uint32_t G(uint32_t x, int r) const {
-        uint8_t u0 = H_TABLE[(x >> 24) & 0xFF];
-        uint8_t u1 = H_TABLE[(x >> 16) & 0xFF];
-        uint8_t u2 = H_TABLE[(x >> 8) & 0xFF];
-        uint8_t u3 = H_TABLE[(x) & 0xFF];
-        uint32_t v = (uint32_t(u0) << 24) | (uint32_t(u1) << 16)
-            | (uint32_t(u2) << 8) | uint32_t(u3);
-        return rotl(v, r);
-    }
-
-    void setKey(const std::string& key) { keySchedule(key); }
-
-    void crypt(const uint8_t in[16], uint8_t out[16]) const {
-        cryptBlock(in, out);
-    }
-};
-
-const uint8_t BelT::H_TABLE[256] = {
-    0xB1,0x94,0xBA,0xC8,0x0A,0x08,0xF5,0x3B,0x36,0x6D,0x00,0x8E,0x58,0x4A,0x5D,0xE4,
-    0x85,0x04,0xFA,0x9D,0x1B,0xB6,0xC7,0xAC,0x25,0x2E,0x72,0xC2,0x02,0xFD,0xCE,0x0D,
-    0x5B,0xE3,0xD6,0x12,0x17,0xB9,0x61,0x81,0xFE,0x67,0x86,0xAD,0x71,0x6B,0x89,0x0B,
-    0x5C,0xB0,0xC0,0xFF,0x33,0xC3,0x56,0xB8,0x35,0xC4,0x05,0xAE,0xD8,0xE0,0x7F,0x99,
-    0xE1,0x2B,0xDC,0x1A,0xE2,0x82,0x57,0xEC,0x70,0x3F,0xCC,0xF0,0x95,0xEE,0x8D,0xF1,
-    0xC1,0xAB,0x76,0x38,0x9F,0xE6,0x78,0xCA,0xF7,0xC6,0xF8,0x60,0xD5,0xBB,0x9C,0x4F,
-    0xF3,0x3C,0x65,0x7B,0x63,0x7C,0x30,0x6A,0xDD,0x4E,0xA7,0x79,0x9E,0xB2,0x3D,0x31,
-    0x3E,0x98,0xB5,0x6E,0x27,0xD3,0xBC,0xCF,0x59,0x1E,0x18,0x1F,0x4C,0x5A,0xB7,0x93,
-    0xE9,0xDE,0xE7,0x2C,0x8F,0x0C,0x0F,0xA6,0x2D,0xDB,0x49,0xF4,0x6F,0x73,0x96,0x47,
-    0x06,0x07,0x53,0x16,0xED,0x24,0x7A,0x37,0x39,0xCB,0xA3,0x83,0x03,0xA9,0x8B,0xF6,
-    0x92,0xBD,0x9B,0x1C,0xE5,0xD1,0x41,0x01,0x54,0x45,0xFB,0xC9,0x5E,0x4D,0x0E,0xF2,
-    0x68,0x20,0x80,0xAA,0x22,0x7D,0x64,0x2F,0x26,0x87,0xF9,0x34,0x90,0x40,0x55,0x11,
-    0xBE,0x32,0x97,0x13,0x43,0xFC,0x9A,0x48,0xA0,0x2A,0x88,0x5F,0x19,0x4B,0x09,0xA1,
-    0x7E,0xCD,0xA4,0xD0,0x15,0x44,0xAF,0x8C,0xA5,0x84,0x50,0xBF,0x66,0xD2,0xE8,0x8A,
-    0xA2,0xD7,0x46,0x52,0x42,0xA8,0xDF,0xB3,0x69,0x74,0xC5,0x51,0xEB,0x23,0x29,0x21,
-    0xD4,0xEF,0xD9,0xB4,0x3A,0x62,0x28,0x75,0x91,0x14,0x10,0xEA,0x77,0x6C,0xDA,0x1D
-};
-
-void BelT::keySchedule(const std::string& keyStr) {
-    if (keyStr.size() != 32) return;
-    const uint8_t* kb = reinterpret_cast<const uint8_t*>(keyStr.data());
-    uint32_t k_t[8];
-    for (int i = 0; i < 8; ++i) k_t[i] = loadBE32(kb + 4 * i);
-    for (int i = 1; i <= 56; ++i) roundKeys[i] = k_t[(i - 1) % 8];
-}
-
-void BelT::cryptBlock(const uint8_t in[16], uint8_t out[16]) const {
-    uint32_t a = loadBE32(in + 0);
-    uint32_t b = loadBE32(in + 4);
-    uint32_t c = loadBE32(in + 8);
-    uint32_t d = loadBE32(in + 12);
-
-    for (int r = 1; r <= 8; ++r) {
-        b = b ^ G(a + roundKeys[7 * r - 6], 5);
-        c = c ^ G(d + roundKeys[7 * r - 5], 21);
-        a = a - G(b + roundKeys[7 * r - 4], 13);
-
-        uint32_t e = G(b + c + roundKeys[7 * r - 3], 21) ^ uint32_t(r);
-        b = b + e;
-        c = c - e;
-
-        d = d + G(c + roundKeys[7 * r - 2], 13);
-        b = b ^ G(a + roundKeys[7 * r - 1], 21);
-        c = c ^ G(d + roundKeys[7 * r], 5);
-
-        std::swap(a, b);
-        std::swap(c, d);
-        std::swap(b, c);
-    }
-
-    storeBE32(out + 0, b);
-    storeBE32(out + 4, d);
-    storeBE32(out + 8, a);
-    storeBE32(out + 12, c);
-}
-
-struct GF128 {
-    uint64_t hi;
-    uint64_t lo;
-
-    static GF128 fromBytes(const uint8_t b[16]) {
-        GF128 r;
-        r.hi = (uint64_t(b[0]) << 56) | (uint64_t(b[1]) << 48)
-            | (uint64_t(b[2]) << 40) | (uint64_t(b[3]) << 32)
-            | (uint64_t(b[4]) << 24) | (uint64_t(b[5]) << 16)
-            | (uint64_t(b[6]) << 8) | uint64_t(b[7]);
-        r.lo = (uint64_t(b[8]) << 56) | (uint64_t(b[9]) << 48)
-            | (uint64_t(b[10]) << 40) | (uint64_t(b[11]) << 32)
-            | (uint64_t(b[12]) << 24) | (uint64_t(b[13]) << 16)
-            | (uint64_t(b[14]) << 8) | uint64_t(b[15]);
-        return r;
-    }
-    void toBytes(uint8_t b[16]) const {
-        for (int i = 0; i < 8; ++i) {
-            b[i] = uint8_t(hi >> (56 - 8 * i));
-            b[8 + i] = uint8_t(lo >> (56 - 8 * i));
+    inline BigInt generate_prime(int bits) {
+        while (true) {
+            BigInt cand = random_bigint(bits); cand |= 1;
+            if (miller_rabin(cand, 40)) return cand;
         }
     }
-    GF128 operator^(const GF128& o) const { return { hi ^ o.hi, lo ^ o.lo }; }
-};
 
-static GF128 gf128Mul(GF128 X, GF128 H) {
-    GF128 Z{ 0, 0 };
-    GF128 V = H;
-    for (int i = 0; i < 128; ++i) {
-        uint64_t bit;
-        if (i < 64) bit = (X.hi >> (63 - i)) & 1ULL;
-        else        bit = (X.lo >> (127 - i)) & 1ULL;
+    struct RSAKeyPair {
+        BigInt N, e, d, p, q, dp, dq, q_inv;
+    };
 
-        uint64_t mask = 0ULL - bit;
-
-        Z.hi ^= V.hi & mask;
-        Z.lo ^= V.lo & mask;
-
-        uint64_t msb = V.hi >> 63;
-        uint64_t rmask = 0ULL - msb;
-        V.hi = (V.hi << 1) | (V.lo >> 63);
-        V.lo = (V.lo << 1) ^ (rmask & 0x87ULL);
+    inline RSAKeyPair generate_rsa_key(int bits) {
+        int pbits = bits / 2, qbits = bits - pbits;
+        BigInt p, q;
+        do { p = generate_prime(pbits); q = generate_prime(qbits); } while (p == q);
+        BigInt N = p * q;
+        BigInt pm1 = p - 1, qm1 = q - 1, x, y;
+        BigInt g = gcd_extended(pm1, qm1, x, y);
+        BigInt lambda = (pm1 / g) * qm1;
+        BigInt e = 65537;
+        if (boost::multiprecision::gcd(e, lambda) != 1) return generate_rsa_key(bits);
+        BigInt d = mod_inverse(e, lambda);
+        RSAKeyPair kp;
+        kp.N = N; kp.e = e; kp.d = d; kp.p = p; kp.q = q;
+        kp.dp = d % (p - 1); kp.dq = d % (q - 1);
+        kp.q_inv = mod_inverse(q % p, p);
+        return kp;
     }
-    return Z;
+
+    inline BigInt bytes_to_bigint(const vector<uint8_t>& b) {
+        BigInt r = 0; for (uint8_t x : b) { r <<= 8; r |= x; } return r;
+    }
+
+    inline vector<uint8_t> bigint_to_bytes(const BigInt& x, size_t len) {
+        vector<uint8_t> out(len, 0); BigInt t = x;
+        for (size_t i = 0; i < len; ++i) { out[len - 1 - i] = (uint8_t)(t & 0xFF); t >>= 8; }
+        return out;
+    }
 }
 
-class GHASH {
-private:
-    GF128 H_;
-public:
-    void setKey(const uint8_t H_bytes[16]) { H_ = GF128::fromBytes(H_bytes); }
+namespace rsa_core {
+    using namespace rsa_math;
 
-    void updateBlocks(const uint8_t* data, size_t len, uint8_t Y[16]) const {
-        GF128 y = GF128::fromBytes(Y);
-        size_t blocks = (len + 15) / 16;
-        for (size_t i = 0; i < blocks; ++i) {
-            uint8_t buf[16] = { 0 };
-            size_t chunk = (len - i * 16 < 16) ? (len - i * 16) : 16;
-            std::memcpy(buf, data + i * 16, chunk);
+    inline BigInt rsa_encrypt_raw(const BigInt& m, const BigInt& e, const BigInt& N) {
+        return mod_pow(m % N, e, N);
+    }
 
-            GF128 x = GF128::fromBytes(buf);
-            y = y ^ x;
-            y = gf128Mul(y, H_);
+    inline BigInt rsa_decrypt_crt(const BigInt& c, const RSAKeyPair& kp) {
+        BigInt m1 = mod_pow_ladder(c % kp.p, kp.dp, kp.p);
+        BigInt m2 = mod_pow_ladder(c % kp.q, kp.dq, kp.q);
+        BigInt h = (kp.q_inv * (m1 - m2)) % kp.p;
+        if (h < 0) h += kp.p;
+        return m2 + h * kp.q;
+    }
+
+    inline BigInt rsa_decrypt_blinded(const BigInt& c, const RSAKeyPair& kp) {
+        BigInt r;
+        do { r = random_below(kp.N - 1) + 1; } while (boost::multiprecision::gcd(r, kp.N) != 1);
+        BigInt r_inv = mod_inverse(r, kp.N);
+        BigInt r_e = mod_pow(r, kp.e, kp.N);
+        BigInt c_blinded = (c * r_e) % kp.N;
+        BigInt m_blinded = rsa_decrypt_crt(c_blinded, kp);
+        return (m_blinded * r_inv) % kp.N;
+    }
+}
+
+namespace rsa_oaep {
+    using namespace rsa_math;
+    static constexpr size_t HASH_LEN = 32;
+
+    inline vector<uint8_t> sha3_256(const uint8_t* data, size_t len) {
+        vector<uint8_t> out(HASH_LEN);
+        unsigned int outlen = 0;
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(ctx, EVP_sha3_256(), nullptr);
+        EVP_DigestUpdate(ctx, data, len);
+        EVP_DigestFinal_ex(ctx, out.data(), &outlen);
+        EVP_MD_CTX_free(ctx);
+        return out;
+    }
+
+    inline vector<uint8_t> sha3_256(const vector<uint8_t>& d) {
+        return sha3_256(d.data(), d.size());
+    }
+
+    inline vector<uint8_t> mgf1(const uint8_t* seed, size_t seed_len, size_t mask_len) {
+        vector<uint8_t> mask(mask_len);
+        size_t offset = 0;
+        for (uint32_t counter = 0; offset < mask_len; ++counter) {
+            uint8_t c[4] = { (uint8_t)(counter >> 24), (uint8_t)(counter >> 16),
+                            (uint8_t)(counter >> 8), (uint8_t)counter };
+            EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+            EVP_DigestInit_ex(ctx, EVP_sha3_256(), nullptr);
+            EVP_DigestUpdate(ctx, seed, seed_len);
+            EVP_DigestUpdate(ctx, c, 4);
+            uint8_t h[HASH_LEN]; unsigned int hlen = 0;
+            EVP_DigestFinal_ex(ctx, h, &hlen);
+            EVP_MD_CTX_free(ctx);
+            size_t to_copy = min<size_t>(HASH_LEN, mask_len - offset);
+            memcpy(mask.data() + offset, h, to_copy);
+            offset += to_copy;
         }
-        y.toBytes(Y);
-    }
-};
-
-class GCM {
-private:
-    BelT belt_;
-    uint8_t H_bytes_[16];
-
-public:
-    explicit GCM(const std::string& key) {
-        belt_.setKey(key);
-        uint8_t zero[16] = { 0 };
-        belt_.crypt(zero, H_bytes_);
+        return mask;
     }
 
-    void encrypt(const std::string& plain,
-        const std::string& aad,
-        const uint8_t IV[12],
-        std::string& cipher_out,
-        uint8_t tag[16]) const {
-        cipher_out.assign(plain.size(), '\0');
-        if (!plain.empty()) {
-            ctrCrypt(reinterpret_cast<const uint8_t*>(plain.data()),
-                plain.size(),
-                IV,
-                reinterpret_cast<uint8_t*>(&cipher_out[0]));
+    inline vector<uint8_t> oaep_encode(const vector<uint8_t>& M,
+        const vector<uint8_t>& label, size_t k)
+    {
+        if (M.size() > k - 2 * HASH_LEN - 2)
+            throw runtime_error("OAEP: message too long");
+        vector<uint8_t> lHash = sha3_256(label);
+        size_t db_len = k - HASH_LEN - 1;
+        vector<uint8_t> DB(db_len, 0);
+        memcpy(DB.data(), lHash.data(), HASH_LEN);
+        size_t ps_len = db_len - HASH_LEN - 1 - M.size();
+        DB[HASH_LEN + ps_len] = 0x01;
+        memcpy(DB.data() + HASH_LEN + ps_len + 1, M.data(), M.size());
+        vector<uint8_t> seed(HASH_LEN);
+        for (size_t i = 0; i < HASH_LEN; ++i) seed[i] = (uint8_t)(rng()() & 0xFF);
+        auto dbMask = mgf1(seed.data(), seed.size(), db_len);
+        vector<uint8_t> maskedDB(db_len);
+        for (size_t i = 0; i < db_len; ++i) maskedDB[i] = DB[i] ^ dbMask[i];
+        auto seedMask = mgf1(maskedDB.data(), maskedDB.size(), HASH_LEN);
+        vector<uint8_t> maskedSeed(HASH_LEN);
+        for (size_t i = 0; i < HASH_LEN; ++i) maskedSeed[i] = seed[i] ^ seedMask[i];
+        vector<uint8_t> EM(k, 0);
+        EM[0] = 0x00;
+        memcpy(EM.data() + 1, maskedSeed.data(), HASH_LEN);
+        memcpy(EM.data() + 1 + HASH_LEN, maskedDB.data(), db_len);
+        return EM;
+    }
+
+    inline bool oaep_decode(const vector<uint8_t>& EM,
+        const vector<uint8_t>& label, vector<uint8_t>& M_out)
+    {
+        size_t k = EM.size();
+        if (k < 2 * HASH_LEN + 2) return false;
+        size_t db_len = k - HASH_LEN - 1;
+        uint8_t err = 0;
+        err |= EM[0];
+        const uint8_t* maskedSeed = EM.data() + 1;
+        const uint8_t* maskedDB = EM.data() + 1 + HASH_LEN;
+        auto seedMask = mgf1(maskedDB, db_len, HASH_LEN);
+        vector<uint8_t> seed(HASH_LEN);
+        for (size_t i = 0; i < HASH_LEN; ++i) seed[i] = maskedSeed[i] ^ seedMask[i];
+        auto dbMask = mgf1(seed.data(), seed.size(), db_len);
+        vector<uint8_t> DB(db_len);
+        for (size_t i = 0; i < db_len; ++i) DB[i] = maskedDB[i] ^ dbMask[i];
+        vector<uint8_t> lHash = sha3_256(label);
+        uint8_t lhash_diff = 0;
+        for (size_t i = 0; i < HASH_LEN; ++i) lhash_diff |= (uint8_t)(DB[i] ^ lHash[i]);
+        err |= lhash_diff;
+        size_t msg_offset = db_len;
+        uint8_t found = 0;
+        for (size_t i = HASH_LEN; i < db_len; ++i) {
+            uint8_t b = DB[i];
+            uint8_t is_one = (uint8_t)(b == 0x01);
+            uint8_t is_zero = (uint8_t)(b == 0x00);
+            uint8_t bad = (uint8_t)((1 - found) & (1 - is_one) & (1 - is_zero));
+            err |= bad;
+            uint8_t newly_found = (uint8_t)((1 - found) & is_one);
+            msg_offset = (size_t)newly_found * (i + 1) + (size_t)(1 - newly_found) * msg_offset;
+            found |= newly_found;
         }
-
-        GHASH gh;
-        gh.setKey(H_bytes_);
-
-        uint8_t Y[16] = { 0 };
-        gh.updateBlocks(reinterpret_cast<const uint8_t*>(aad.data()), aad.size(), Y);
-        gh.updateBlocks(reinterpret_cast<const uint8_t*>(cipher_out.data()),
-            cipher_out.size(), Y);
-
-        uint8_t L[16] = { 0 };
-        uint64_t aad_bits = uint64_t(aad.size()) * 8;
-        uint64_t c_bits = uint64_t(cipher_out.size()) * 8;
-        for (int i = 0; i < 8; ++i) {
-            L[i] = uint8_t(aad_bits >> (56 - 8 * i));
-            L[8 + i] = uint8_t(c_bits >> (56 - 8 * i));
-        }
-        gh.updateBlocks(L, 16, Y);
-
-        uint8_t CB0[16] = { 0 };
-        std::memcpy(CB0, IV, 12);
-        uint8_t S0[16];
-        belt_.crypt(CB0, S0);
-
-        for (int i = 0; i < 16; ++i) tag[i] = Y[i] ^ S0[i];
+        err |= (uint8_t)(1 - found);
+        size_t msg_len = db_len - msg_offset;
+        M_out.assign(msg_len, 0);
+        for (size_t i = 0; i < msg_len; ++i) M_out[i] = DB[msg_offset + i];
+        uint8_t ok_mask = (uint8_t)(err == 0 ? 0xFF : 0x00);
+        for (size_t i = 0; i < M_out.size(); ++i) M_out[i] &= ok_mask;
+        return err == 0;
     }
 
-    static bool tagEqual(const uint8_t a[16], const uint8_t b[16]) {
-        uint8_t diff = 0;
-        for (int i = 0; i < 16; ++i) diff |= a[i] ^ b[i];
-        return diff == 0;
+    inline vector<uint8_t> encrypt(const vector<uint8_t>& M,
+        const vector<uint8_t>& label, const rsa_math::RSAKeyPair& kp)
+    {
+        size_t k = (bit_length(kp.N) + 7) / 8;
+        auto EM = oaep_encode(M, label, k);
+        BigInt c = rsa_core::rsa_encrypt_raw(bytes_to_bigint(EM), kp.e, kp.N);
+        return bigint_to_bytes(c, k);
     }
 
-private:
-    void ctrCrypt(const uint8_t* in, size_t len,
-        const uint8_t IV[12], uint8_t* out) const {
-        constexpr size_t BLOCK = 16;
-        for (size_t off = 0; off < len; off += BLOCK) {
-            uint32_t counter = uint32_t(off / BLOCK + 1);
-
-            uint8_t CB[BLOCK];
-            std::memcpy(CB, IV, 12);
-            CB[12] = uint8_t(counter >> 24);
-            CB[13] = uint8_t(counter >> 16);
-            CB[14] = uint8_t(counter >> 8);
-            CB[15] = uint8_t(counter);
-
-            uint8_t S[BLOCK];
-            belt_.crypt(CB, S);
-
-            size_t chunk = (len - off < BLOCK) ? (len - off) : BLOCK;
-            for (size_t k = 0; k < chunk; ++k) out[off + k] = in[off + k] ^ S[k];
-        }
+    inline bool decrypt(const vector<uint8_t>& C,
+        const vector<uint8_t>& label, const rsa_math::RSAKeyPair& kp,
+        vector<uint8_t>& M_out)
+    {
+        size_t k = (bit_length(kp.N) + 7) / 8;
+        if (C.size() != k) return false;
+        BigInt c = bytes_to_bigint(C);
+        if (c >= kp.N) return false;
+        BigInt m = rsa_core::rsa_decrypt_blinded(c, kp);
+        return oaep_decode(bigint_to_bytes(m, k), label, M_out);
     }
-};
-
-
-static std::string generateKey() {
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<int> dist(0, 255);
-    std::string k(32, '\0');
-    for (int i = 0; i < 32; ++i) k[i] = static_cast<char>(dist(gen));
-    return k;
 }
 
-static void printHexBytes(const uint8_t* p, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        std::cout << std::hex << std::setw(2) << std::setfill('0')
-            << int(p[i]) << " ";
-    }
-    std::cout << std::dec << std::setfill(' ');
+static void print_hex(const string& name, const vector<uint8_t>& v, size_t limit = 32) {
+    cout << name << " (" << v.size() << " байт): ";
+    size_t n = min(v.size(), limit);
+    for (size_t i = 0; i < n; ++i)
+        cout << hex << setw(2) << setfill('0') << (int)v[i];
+    if (v.size() > limit) cout << "...";
+    cout << dec << "\n";
 }
-
-static void printHexString(const std::string& s) {
-    printHexBytes(reinterpret_cast<const uint8_t*>(s.data()), s.size());
-}
-
-static bool parseHexBytes(const std::string& s, uint8_t* out, size_t n) {
-    if (s.size() != n * 2) return false;
-    for (size_t i = 0; i < n; ++i) {
-        auto hv = [](char c) -> int {
-            if (c >= '0' && c <= '9') return c - '0';
-            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-            return -1;
-            };
-        int h1 = hv(s[2 * i]);
-        int h2 = hv(s[2 * i + 1]);
-        if (h1 < 0 || h2 < 0) return false;
-        out[i] = uint8_t((h1 << 4) | h2);
-    }
-    return true;
-}
-
-static void pauseAndClear() {
-    std::cout << "\nНажмите Enter, чтобы продолжить...";
-    std::cin.get();
-#ifdef _WIN32
-    system("cls");
-#else
-    system("clear");
-#endif
-}
-
 
 int main() {
     setlocale(LC_ALL, "ru");
+    cout << "RSA-3072 + SHA3-256 + OAEP + CRT + Blinding\n\n";
 
-    std::string key = generateKey();
-    std::string text = "Hello, AEAD-GCM!";
-    std::string aad = "Additional data";
-    uint8_t iv[12];
-    for (int i = 0; i < 12; ++i) iv[i] = uint8_t(i);
+    cout << "[*] Генерация ключа 3072 бит...\n";
+    rsa_math::RSAKeyPair kp = rsa_math::generate_rsa_key(3072);
+    cout << "    |N| = " << rsa_math::bit_length(kp.N) << " бит\n";
+    cout << "    |p| = " << rsa_math::bit_length(kp.p) << " бит\n";
+    cout << "    |q| = " << rsa_math::bit_length(kp.q) << " бит\n\n";
 
-    int choice = -1;
-    while (choice != 0) {
-        std::cout << "\nМЕНЮ \n";
-        std::cout << " 1. Сгенерировать новый ключ\n";
-        std::cout << " 2. Задать ключ вручную (hex, 64 символа)\n";
-        std::cout << " 3. Изменить открытый текст\n";
-        std::cout << " 4. Изменить дополнительные данные (AAD)\n";
-        std::cout << " 5. Изменить вектор инициализации (IV)\n";
-        std::cout << " 6. Показать текущие данные и результаты шифрования\n";
-        std::cout << " 0. Выход\n";
-        std::cout << "Выберите пункт: ";
+    string text = "Лабораторная №2: RSA + CRT + OAEP + Blinding";
+    vector<uint8_t> M(text.begin(), text.end());
+    vector<uint8_t> label;
 
-        if (!(std::cin >> choice)) {
-            std::cin.clear();
-            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-            std::cout << "Некорректный ввод. Попробуйте снова.\n";
-            continue;
-        }
-        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    print_hex("[+] M", M);
+    auto C = rsa_oaep::encrypt(M, label, kp);
+    print_hex("[+] C", C);
 
-        switch (choice) {
-        case 1: {
-            key = generateKey();
-            std::cout << "Ключ сгенерирован (hex, 32 байта):\n  ";
-            printHexString(key);
-            std::cout << "\n";
-            pauseAndClear();
-            break;
-        }
-        case 2: {
-            std::cout << "Введите 32 байта ключа в hex (64 символа):\n> ";
-            std::string line;
-            std::getline(std::cin, line);
-            std::string tmp(32, '\0');
-            if (parseHexBytes(line, reinterpret_cast<uint8_t*>(&tmp[0]), 32)) {
-                key = tmp;
-                std::cout << "Ключ принят.\n";
-            }
-            else {
-                std::cout << "Ошибка: некорректная hex-строка (нужно 64 символа).\n";
-            }
-            pauseAndClear();
-            break;
-        }
-        case 3: {
-            std::cout << "Введите открытый текст: ";
-            std::getline(std::cin, text);
-            std::cout << "Сохранено, размер: " << text.size() << " байт.\n";
-            pauseAndClear();
-            break;
-        }
-        case 4: {
-            std::cout << "Введите AAD (доп. аутентифицируемые данные): ";
-            std::getline(std::cin, aad);
-            std::cout << "Сохранено, размер: " << aad.size() << " байт.\n";
-            pauseAndClear();
-            break;
-        }
-        case 5: {
-            std::cout << "Введите IV: 12 байт hex (24 символа):\n> ";
-            std::string line;
-            std::getline(std::cin, line);
-            uint8_t tmp[12];
-            if (parseHexBytes(line, tmp, 12)) {
-                std::memcpy(iv, tmp, 12);
-                std::cout << "IV сохранён.\n";
-            }
-            else {
-                std::cout << "Ошибка: некорректная hex-строка (нужно 24 символа).\n";
-            }
-            pauseAndClear();
-            break;
-        }
-        case 6: {
-            std::cout << "ТЕКУЩИЕ ДАННЫЕ\n";
-            std::cout << "Ключ (hex, 32 байта):\n  ";
-            printHexString(key);
-            std::cout << "\n";
+    vector<uint8_t> M2;
+    bool ok = rsa_oaep::decrypt(C, label, kp, M2);
+    cout << "[+] decrypt ok = " << (ok ? "true" : "false") << "\n";
+    print_hex("[+] M'", M2);
+    cout << "[+] M' строка: \"" << string(M2.begin(), M2.end()) << "\"\n\n";
 
-            std::cout << "Открытый текст (" << text.size() << " байт):\n  \""
-                << text << "\"\n";
+    vector<uint8_t> bad = C;
+    bad[10] ^= 0x01;
+    vector<uint8_t> M3;
+    bool ok2 = rsa_oaep::decrypt(bad, label, kp, M3);
+    cout << "[+] decrypt(повреждён) ok = " << (ok2 ? "true" : "false") << "\n";
+    print_hex("[+] M'(повреждён)", M3);
 
-            std::cout << "AAD (" << aad.size() << " байт):\n  \""
-                << aad << "\"\n";
-
-            std::cout << "IV (hex, 12 байт):\n  ";
-            printHexBytes(iv, 12);
-            std::cout << "\n";
-
-            std::cout << "\nРезультаты шифрования\n";
-
-            {
-                BelT belt;
-                belt.setKey(key);
-                uint8_t in[16] = { 0 };
-                std::memcpy(in, text.data(), std::min<size_t>(16, text.size()));
-                uint8_t out[16];
-                belt.crypt(in, out);
-                std::cout << "[Belt, один блок 16 байт]\n";
-                std::cout << "  Вход  (hex): "; printHexBytes(in, 16); std::cout << "\n";
-                std::cout << "  Выход (hex): "; printHexBytes(out, 16); std::cout << "\n";
-            }
-
-            {
-                GCM gcm(key);
-                std::string cipher;
-                uint8_t tag[16];
-                gcm.encrypt(text, aad, iv, cipher, tag);
-                std::cout << "\n[GCM AEAD]\n";
-                std::cout << "  Шифротекст (hex): ";
-                printHexBytes(reinterpret_cast<const uint8_t*>(cipher.data()),
-                    cipher.size());
-                std::cout << "\n  Тег (hex, 16 байт): ";
-                printHexBytes(tag, 16);
-                std::cout << "\n";
-
-                uint8_t tagCopy[16];
-                std::memcpy(tagCopy, tag, 16);
-                std::cout << "  Тег (не изменён):       "
-                    << (GCM::tagEqual(tag, tagCopy) ? "совпадает" : "не совпадает")
-                    << "\n";
-                tagCopy[15] ^= 0x01;
-                std::cout << "  Тег (изменён младший):  "
-                    << (GCM::tagEqual(tag, tagCopy) ? "совпадает" : "не совпадает")
-                    << "\n";
-            }
-
-            std::cout << "\n[Справка] Константы:\n"
-                << "  p(x) = 0x12B (x^8+x^5+x^3+x+1) — неприводим в GF(2)[x]\n"
-                << "  f(x) = x^128+x^7+x^2+x+1 — полином GHASH\n";
-
-            pauseAndClear();
-            break;
-        }
-        case 0:
-            std::cout << "Выход из программы.\n";
-            break;
-        default:
-            std::cout << "Неверный пункт меню.\n";
-            pauseAndClear();
-            break;
-        }
-    }
     return 0;
 }
